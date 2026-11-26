@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import '../common/ftp_enums.dart';
 import '../common/ftp_exceptions.dart';
 import '../common/logger.dart';
 import '../common/utils.dart';
 import 'ftp_reply.dart';
+import 'ftp_text_codec.dart';
 
 class FTPSocket {
   final String host;
@@ -20,56 +22,76 @@ class FTPSocket {
   TransferType transferType;
 
   late RawSocket _socket;
+  final FtpCommandEncoder _encodeCommand;
+  final FtpResponseDecoder decodeResponse;
+  final List<int> _pendingReply = [];
+  int _lineStart = 0;
+  int? _replyCode;
+  bool _multiline = false;
 
   FTPSocket(this.host, this.port, this.securityType, this.logger, this.timeout,
       {this.supportIPV6 = false,
       this.listCommand = ListCommand.mlsd,
       this.transferMode = TransferMode.passive,
-      this.transferType = TransferType.auto});
+      this.transferType = TransferType.auto,
+      FtpCommandEncoder? encodeCommand,
+      FtpResponseDecoder? decodeResponse})
+      : _encodeCommand = encodeCommand ?? utf8.encode,
+        decodeResponse = decodeResponse ?? utf8.decode;
 
-  /// Read the FTP Server response from the Stream
-  ///
-  /// Blocks until data is received!
+  /// Reads a whole reply before decoding so socket chunks can split characters.
   Future<FTPReply> readResponse() async {
-    StringBuffer res = StringBuffer();
-    await Future.doWhile(() async {
-      bool dataReceivedSuccessfully = false;
+    final deadline = Stopwatch()..start();
+    while (deadline.elapsed < Duration(seconds: timeout)) {
+      final bytes = _socket.available() > 0 ? _socket.read() : null;
+      if (bytes != null) _pendingReply.addAll(bytes);
+      final reply = await _takeReply();
+      if (reply != null) return reply;
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+    }
+    throw FTPConnectException('Timeout reached for Receiving response !');
+  }
 
-      //this is used to read all data for specific command line
-      while (_socket.available() > 0) {
-        res.write(utf8.decode(_socket.read()!).trim());
-        dataReceivedSuccessfully = true;
+  Future<FTPReply?> _takeReply() async {
+    for (var index = _lineStart; index < _pendingReply.length; index++) {
+      if (_pendingReply[index] != 10) continue;
+      final lineLength = index - _lineStart;
+      if (_replyCode == null && lineLength >= 3) {
+        _replyCode = _codeAt(_lineStart);
+        _multiline = lineLength >= 4 && _pendingReply[_lineStart + 3] == 45;
+        if (_multiline) {
+          _lineStart = index + 1;
+          continue;
+        }
+      } else if (_multiline &&
+          (lineLength < 4 ||
+              _codeAt(_lineStart) != _replyCode ||
+              _pendingReply[_lineStart + 3] != 32)) {
+        _lineStart = index + 1;
+        continue;
       }
-      if (dataReceivedSuccessfully) return false;
 
-      await Future.delayed(Duration(milliseconds: 300));
-      return true;
-    }).timeout(Duration(seconds: timeout), onTimeout: () {
-      throw FTPConnectException('Timeout reached for Receiving response !');
-    });
-
-    String r = res.toString();
-    if (r.startsWith("\n")) r = r.replaceFirst("\n", "");
-
-    if (r.length < 3) throw FTPConnectException("Illegal Reply Exception", r);
-
-    int? code;
-    List<String> lines = r.split('\n');
-    //get last code
-    String? line;
-    for (line in lines) {
-      if (line.length >= 3) code = int.tryParse(line.substring(0, 3)) ?? code;
+      final code = _replyCode;
+      final bytes = Uint8List.fromList(_pendingReply.sublist(0, index + 1));
+      _pendingReply.removeRange(0, index + 1);
+      _lineStart = 0;
+      _replyCode = null;
+      _multiline = false;
+      final message = (await decodeResponse(bytes)).trim();
+      if (code == null) {
+        throw FTPConnectException('Illegal Reply Exception', message);
+      }
+      final reply = FTPReply(code, message);
+      logger.log('< ${reply.toString()}');
+      return reply;
     }
-    //multiline response
-    if (line != null && line.length >= 4 && line[3] == '-') {
-      return await readResponse();
-    }
+    return null;
+  }
 
-    if (code == null) throw FTPConnectException("Illegal Reply Exception", r);
-
-    FTPReply reply = FTPReply(code, r);
-    logger.log('< ${reply.toString()}');
-    return reply;
+  int? _codeAt(int offset) {
+    final digits = _pendingReply.sublist(offset, offset + 3);
+    if (digits.any((byte) => byte < 48 || byte > 57)) return null;
+    return (digits[0] - 48) * 100 + (digits[1] - 48) * 10 + digits[2] - 48;
   }
 
   /// Send a command [cmd] to the FTP Server.
@@ -78,10 +100,31 @@ class FTPSocket {
   /// reply. When `false` it only writes the command — used for data-transfer
   /// commands (RETR/STOR/LIST) whose reply is read later, once the data socket
   /// is ready — and resolves to an empty [FTPReply].
-  Future<FTPReply> sendCommand(String cmd, {bool shouldWait = true}) {
+  Future<FTPReply> sendCommand(String cmd, {bool shouldWait = true}) async {
+    if (cmd.contains('\r') || cmd.contains('\n') || cmd.contains('\x00')) {
+      throw ArgumentError('An FTP command cannot contain CR, LF or NUL.');
+    }
+    final encoded = await _encodeCommand(cmd);
+    if (encoded.isEmpty ||
+        encoded.any(
+            (byte) => byte <= 0 || byte > 255 || byte == 13 || byte == 10)) {
+      throw FTPConnectException('Invalid FTP command bytes.');
+    }
+    final bytes = Uint8List.fromList([...encoded, 13, 10]);
     _logCommand(cmd);
-    _socket.write(utf8.encode('$cmd\r\n'));
-    if (!shouldWait) return Future.value(const FTPReply(0, ''));
+    final deadline = Stopwatch()..start();
+    var offset = 0;
+    while (offset < bytes.length) {
+      if (deadline.elapsed >= Duration(seconds: timeout)) {
+        throw FTPConnectException('Timeout reached for sending a command.');
+      }
+      final written = _socket.write(bytes, offset, bytes.length - offset);
+      offset += written;
+      if (written == 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+      }
+    }
+    if (!shouldWait) return const FTPReply(0, '');
     return readResponse();
   }
 
@@ -140,6 +183,10 @@ class FTPSocket {
     // A fresh control connection resets the server to its default (ASCII)
     // transfer type, so drop any cached value to force it to be re-sent.
     transferType = TransferType.auto;
+    _pendingReply.clear();
+    _lineStart = 0;
+    _replyCode = null;
+    _multiline = false;
 
     final timeout = Duration(seconds: this.timeout);
 
@@ -252,32 +299,29 @@ class FTPSocket {
     logger.log('Opening DataSocket to Port $port');
     final Socket dataSocket = await connectDataSocket(port);
 
-    // The command reply is handled here; the payload flows over [dataSocket].
-    sendCommand(command, shouldWait: false);
-
-    // Test if the data connection was accepted.
-    response = await readResponse();
-    // Some servers return two lines (e.g. 125/150 then 226) when finished.
-    final bool isTransferCompleted = response.isSuccessCode();
-    if (!isTransferCompleted && response.code != 125 && response.code != 150) {
-      throw FTPConnectException('Connection refused. ', response.message);
-    }
-
     final T result;
+    final bool isTransferCompleted;
     try {
+      // The command reply is handled here; the payload flows over the data socket.
+      await sendCommand(command, shouldWait: false);
+      response = await readResponse();
+      isTransferCompleted = response.isSuccessCode();
+      if (!isTransferCompleted &&
+          response.code != 125 &&
+          response.code != 150) {
+        throw FTPConnectException('Connection refused. ', response.message);
+      }
       result = await onData(dataSocket);
     } finally {
       dataSocket.destroy();
     }
 
     if (!isTransferCompleted) {
-      // Ensure all data was transferred successfully.
       response = await readResponse();
       if (!response.isSuccessCode()) {
         throw FTPConnectException('Transfer Error.', response.message);
       }
     }
-
     return result;
   }
 

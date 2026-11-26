@@ -6,4 +6,5 @@ export 'src/common/ftp_enums.dart';
 export 'src/common/file_transfer_client.dart';
 export 'src/common/logger.dart';
 export 'src/ftp/ftpconnect_base.dart';
+export 'src/ftp/ftp_text_codec.dart';
 export 'src/sftp/sftp_connect.dart';

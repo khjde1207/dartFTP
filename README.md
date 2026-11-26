@@ -175,6 +175,25 @@ final Uint8List bytes = await ftpConnect.downloadToBytes('remote.bin');
 | ------------ |--------------------------------------|
 |`securityType`| `SecurityType.ftp` / `ftpes` / `ftps` (Defaults to `ftp`) |
 
+Both FTP text callbacks default to UTF-8. For servers using a legacy
+ASCII-compatible charset, pass encoder and decoder functions when constructing
+the client. Callbacks can return their results synchronously or as futures.
+
+```dart
+import 'dart:convert';
+import 'package:ftpconnect/ftpconnect.dart';
+
+final client = FTPConnect(
+  'example.com',
+  encodeCommand: latin1.encode,
+  decodeResponse: latin1.decode,
+);
+```
+
+The encoder receives one command without CRLF. The decoder receives a full
+control reply or a full directory listing. File data stays in its original
+binary form and bypasses both callbacks.
+
 ### SFTP-only parameters (`SFTPConnect`)
 
 |  Property | Description                                          |

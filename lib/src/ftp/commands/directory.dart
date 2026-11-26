@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -61,7 +60,9 @@ class FTPDirectory {
 
     // Convert the listing response into FTPEntry objects.
     List<FTPEntry> lstFTPEntries = <FTPEntry>[];
-    utf8.decode(lstDirectoryListing).split('\n').forEach((line) {
+    final listing =
+        await _socket.decodeResponse(Uint8List.fromList(lstDirectoryListing));
+    listing.split('\n').forEach((line) {
       if (line.trim().isNotEmpty) {
         lstFTPEntries.add(
           FTPEntry.parse(line.replaceAll('\r', ""), _socket.listCommand),

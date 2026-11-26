@@ -10,6 +10,7 @@ import '../common/ftp_exceptions.dart';
 import 'commands/directory.dart';
 import 'commands/file.dart';
 import 'ftp_reply.dart';
+import 'ftp_text_codec.dart';
 import 'ftp_socket.dart';
 
 class FTPConnect extends FileTransferClient {
@@ -27,6 +28,10 @@ class FTPConnect extends FileTransferClient {
   /// [pass]: Password if not anonymous login
   /// [debug]: Enable Debug Logging
   /// [timeout]: Timeout in seconds to wait for responses
+  ///
+  /// [encodeCommand] encodes a command without its line ending.
+  /// [decodeResponse] decodes a complete control reply or directory listing.
+  /// Both default to UTF-8 and can use an ASCII-compatible server charset.
   FTPConnect(
     super.host, {
     int? port,
@@ -40,6 +45,8 @@ class FTPConnect extends FileTransferClient {
     this.listCommand = ListCommand.mlsd,
     this.transferMode = TransferMode.passive,
     this.transferType = TransferType.auto,
+    FtpCommandEncoder? encodeCommand,
+    FtpResponseDecoder? decodeResponse,
   }) : super(
           port: port ?? (securityType == SecurityType.ftps ? 990 : 21),
         ) {
@@ -53,6 +60,8 @@ class FTPConnect extends FileTransferClient {
       listCommand: listCommand,
       transferMode: transferMode,
       transferType: transferType,
+      encodeCommand: encodeCommand,
+      decodeResponse: decodeResponse,
     );
   }
 
